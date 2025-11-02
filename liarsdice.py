@@ -5,13 +5,17 @@ import json
 from math import comb
 from collections import deque
 
-# === ANSI COLOURS ===
+# =========================
+# ANSI COLOURS
+# =========================
 GREEN = "\033[92m"
 RESET = "\033[0m"
 
 AI_MEMORY_FILE = "ai_memory.json"
 
-# --- Utilities ---
+# =========================
+# Utilities
+# =========================
 def clear_cmd():
     os.system("cls" if os.name == "nt" else "clear")
 
@@ -28,7 +32,7 @@ def press_to_continue(msg="\nPress Enter to continue: "):
     except EOFError:
         pass
 
-def render_turn_order(order, active_set, current):
+def render_turn_order(order, active_set, current, fast=False):
     """Single-line turn order, removes eliminated, highlights current in green."""
     seq = []
     seen = set()
@@ -42,24 +46,29 @@ def render_turn_order(order, active_set, current):
             seq.append(f"{GREEN}{name}{RESET}")
         else:
             seq.append(name)
-    return " -> ".join(seq)
+    line = " -> ".join(seq)
+    if fast:
+        print(line)
+    else:
+        Print(line)
+    return line
 
-# --- Persistent AI memory ---
-# We expand the stat schema to support emergent behavior.
+
+# =========================
+# Persistent AI memory
+# =========================
 BASE_STATS = {
-    "bluffs_caught": 0,      # times this player was caught bluffing
-    "defended_success": 0,   # times this player’s bid was called and proven true
-    "bluffs_made": 0,        # bids that ended up being bluffs
-    "bluff_success": 0,      # bluff called and survived (rare in pure Liar’s Dice; included for completeness)
-    "truths_made": 0,        # bids that ended up being true
-    "truth_success": 0       # truth called and survived
+    "bluffs_caught": 0,
+    "defended_success": 0,
+    "bluffs_made": 0,
+    "bluff_success": 0,
+    "truths_made": 0,
+    "truth_success": 0,
 }
 
-def _merge_dicts(a, b, scale=1.0):
-    out = {}
-    for k in BASE_STATS:
-        out[k] = a.get(k, 0) + scale * b.get(k, 0)
-    return out
+def _ensure_ai(mem, name):
+    if name not in mem:
+        mem[name] = {k: 0 for k in BASE_STATS}
 
 def load_ai_memory(players):
     data = {}
@@ -67,18 +76,12 @@ def load_ai_memory(players):
         try:
             with open(AI_MEMORY_FILE, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-                # migrate older schema if needed
-                for p in players:
-                    d = raw.get(p, {})
-                    entry = {}
-                    for k in BASE_STATS:
-                        entry[k] = int(d.get(k, 0))
-                    data[p] = entry
+                for k, v in raw.items():
+                    data[k] = {kk: int(v.get(kk, 0)) for kk in BASE_STATS}
         except Exception:
             data = {}
-    # ensure all players exist
     for p in players:
-        data.setdefault(p, {k: 0 for k in BASE_STATS})
+        _ensure_ai(data, p)
     return data
 
 def save_ai_memory(memory):
@@ -90,11 +93,13 @@ def save_ai_memory(memory):
 
 def merge_match_into_global(global_mem, match_mem):
     for name, stats in match_mem.items():
-        gm = global_mem.setdefault(name, {k: 0 for k in BASE_STATS})
+        _ensure_ai(global_mem, name)
         for k in BASE_STATS:
-            gm[k] += stats.get(k, 0)
+            global_mem[name][k] += stats.get(k, 0)
 
-# --- Probability helper ---
+# =========================
+# Probability helper
+# =========================
 def prob_at_least(n, k, p=1/6):
     if n <= 0:
         return 1.0
@@ -105,7 +110,9 @@ def prob_at_least(n, k, p=1/6):
         total += comb(k, i) * (p ** i) * ((1 - p) ** (k - i))
     return total
 
-# --- Dialogue templates ---
+# =========================
+# Dialogue templates
+# =========================
 table_talk = {
     "pre_bid": [
         "[{name}] Hmm... let’s start with this...",
@@ -144,147 +151,435 @@ table_talk = {
     ]
 }
 
-# --- Rate helpers for emergent behavior ---
-def _safe_rate(num, den):
-    return num / max(1, den)
+# =========================
+# Partner helpers
+# =========================
+def assign_partners(players):
+    """
+    Assigns mutual partner groups based on player count.
 
-def combined_stats(name, match_memory, global_memory, global_weight=0.5):
-    m = match_memory.get(name, {k:0 for k in BASE_STATS})
-    g = global_memory.get(name, {k:0 for k in BASE_STATS})
-    return _merge_dicts(m, g, scale=global_weight)
-
-def record_bid_outcome(bidder, was_truth, was_success, match_memory):
-    s = match_memory[bidder]
-    if was_truth:
-        s["truths_made"] += 1
-        if was_success:
-            s["truth_success"] += 1
+    Returns:
+      partners_map: dict[str, list[str]]  # each player -> list of their partners
+      k_partners: int                     # number of partners per player
+      max_winners: int                    # number of total winners allowed
+      split_rule: list[int]               # gold split percentages summing to ~100
+    """
+    n = len(players)
+    if n >= 32:
+        k = 3
+        max_winners = 4
+        split = [25, 25, 25, 25]
+    elif n >= 18:
+        k = 2
+        max_winners = 3
+        split = [34, 33, 33]
     else:
-        s["bluffs_made"] += 1
-        if was_success:
-            s["bluff_success"] += 1
+        k = 1
+        max_winners = 2
+        split = [50, 50]
 
-def play_liars_dice(player_data, gold_bet, enemy_names, difficulty):
-    # Normalize to 8 players including Knight
-    while len(enemy_names) < 7:
+    order = players[:]
+    random.shuffle(order)
+
+    # initialize everyone with empty partner lists
+    partners = {p: [] for p in order}
+
+    if k == 1:
+        # Pair players evenly (A↔B, C↔D, etc.)
+        for i in range(0, len(order) - 1, 2):
+            a, b = order[i], order[i + 1]
+            partners[a].append(b)
+            partners[b].append(a)
+        # if odd number of players, last one pairs with first
+        if len(order) % 2 == 1:
+            last, first = order[-1], order[0]
+            partners[last].append(first)
+            partners[first].append(last)
+
+    elif k == 2:
+        # Group players in triplets that all share each other as partners
+        for i in range(0, len(order), 3):
+            group = order[i:i + 3]
+            for p in group:
+                partners[p].extend([x for x in group if x != p])
+        # Handle leftover players if not divisible by 3
+        leftover = len(order) % 3
+        if leftover and len(order) > 3:
+            group = order[-leftover:]
+            for p in group:
+                partners[p].extend([x for x in group if x != p])
+
+    elif k == 3:
+        # Group players in fours that all share each other as partners
+        for i in range(0, len(order), 4):
+            group = order[i:i + 4]
+            for p in group:
+                partners[p].extend([x for x in group if x != p])
+        # Handle leftovers (just pair them with last full group)
+        leftover = len(order) % 4
+        if leftover and len(order) > 4:
+            group = order[-leftover:]
+            for p in group:
+                partners[p].extend([x for x in group if x != p])
+
+    return partners, k, max_winners, split
+
+def all_partner_dice(name, partners_map, active_players):
+    dice = []
+    for partner in partners_map.get(name, []):
+        if partner in active_players:
+            dice.extend(active_players[partner])
+    return dice
+
+# AI move calculation
+def ai_take_turn(
+    player,
+    active_players,
+    partners,
+    current_bid,
+    current_bidder,
+    global_memory,
+    difficulty,
+    noise_gate=True
+):
+    diff = difficulty
+    total_players_left = len(active_players)
+    total_dice = sum(len(d) for d in active_players.values())
+    dice = active_players[player]
+    partner_dice_list = all_partner_dice(player, partners, active_players)
+
+    # pacing
+    time.sleep(0.015 if total_players_left > 20 else 0.1)
+
+    # dialogue printing — never skip any AI dialogue
+    def maybe_print(line):
+        Print(line)
+
+    _ensure_ai(global_memory, player)
+    self_stats = global_memory[player]
+    defend_success_self = (self_stats["defended_success"] /
+                           max(1, self_stats["defended_success"] + self_stats["bluffs_caught"]))
+    bluff_success_self = (self_stats["bluff_success"] / max(1, self_stats["bluffs_made"]))
+
+    conf_windows = {
+        "easy":   (0.28, 0.45),
+        "medium": (0.50, 0.65),
+        "hard":   (0.85, 0.95)
+    }
+    low, high = conf_windows.get(diff, (0.50, 0.65))
+
+    # Opening bid
+    if not current_bid:
+        min_open = max(2, total_dice // 10)
+        face_counts = {f: dice.count(f) for f in range(1, 7)}
+        common_face = max(face_counts, key=face_counts.get)
+        face_guess = common_face if random.random() < 0.7 else random.randint(2, 5)
+
+        # Hard always considers partners, Medium often, Easy sometimes
+        base_qty = dice.count(face_guess)
+        if diff == "hard":
+            base_qty += sum(1 for v in partner_dice_list if v == face_guess)
+        elif diff == "medium" and random.random() < 0.6:
+            base_qty += sum(1 for v in partner_dice_list if v == face_guess)
+        elif diff == "easy" and random.random() < 0.35:
+            base_qty += sum(1 for v in partner_dice_list if v == face_guess)
+
+        base_qty = max(min_open, base_qty)
+        confidence_factor = 1.0 + (bluff_success_self - 0.5) * (0.4 if diff == "hard" else 0.25)
+        qty_guess = int(max(min_open, min(base_qty + random.choice([0, 1]) * confidence_factor, total_dice)))
+        maybe_print(f"\n{random.choice(table_talk['pre_bid']).format(name=player, next_qty=qty_guess, face=face_guess, target='Knight')}")
+        Print(f"{player} opens with {qty_guess} {face_guess}'s.\n")
+        return (qty_guess, face_guess), player, False, None
+
+    # Evaluate call vs raise
+    qty, face = current_bid
+
+    known_count = dice.count(face)
+    # Hard always counts partners, Medium usually, Easy sometimes
+    if diff == "hard" or (diff == "medium" and random.random() < 0.75) or (diff == "easy" and random.random() < 0.35):
+        known_count += sum(1 for v in partner_dice_list if v == face)
+
+    unknown_dice = total_dice - len(dice) - len(partner_dice_list)
+    need = max(0, qty - known_count)
+    p_true = prob_at_least(need, unknown_dice, p=1/6)
+
+    estimate_factor = random.uniform(low, high)
+    if total_players_left > 10:
+        estimate_factor = min(0.9, max(0.7, estimate_factor - 0.05))
+    if total_players_left <= 4:
+        estimate_factor = random.uniform(0.9, 1.05)
+
+    estimated_total = known_count + int(unknown_dice * estimate_factor) + random.randint(-1, 1)
+    bluff_margin = qty - estimated_total
+
+    call_chance = 0.06 + max(0, bluff_margin) * 0.10
+    call_chance += (1.0 - p_true) * (0.60 if diff == "hard" else 0.40)
+
+    # Additional large-table sanity: if qty is well below expectation, be reluctant to call
+    expected = total_dice / 6.0
+    variance = total_dice * (1/6) * (5/6)
+    std = max(1.0, variance ** 0.5)
+    if total_dice >= 60:
+        if qty <= expected - 0.5 * std:
+            call_chance *= 0.25
+        elif qty <= expected:
+            call_chance *= 0.5
+
+    # Sanity floor
+    if qty <= max(2, total_dice // 4) and p_true > 0.60:
+        call_chance *= 0.10
+
+    threshold_quarter = max(3, (total_dice + 4) // 4)
+    if qty > threshold_quarter:
+        call_chance += 0.12 * (qty - threshold_quarter)
+    if qty > 8:
+        call_chance += 0.08 + (qty - 8) * 0.02
+
+    if diff == "easy":
+        call_chance *= 0.75
+    elif diff == "hard":
+        call_chance *= 0.85
+
+    bidder = current_bidder
+    if bidder:
+        _ensure_ai(global_memory, bidder)
+        opp = global_memory[bidder]
+        opp_defend_success_rate = (opp["defended_success"] /
+                                   max(1, opp["defended_success"] + opp["bluffs_caught"]))
+        opp_bluff_rate = (opp["bluffs_made"] / max(1, opp["truths_made"] + opp["bluffs_made"]))
+        opp_bluff_success_rate = (opp["bluff_success"] / max(1, opp["bluffs_made"]))
+        call_chance *= (1.0 + (opp_bluff_rate - 0.5) * (0.8 if diff == "hard" else 0.5))
+        call_chance *= (1.0 - (opp_defend_success_rate - 0.5) * (0.5 if diff == "hard" else 0.3))
+        call_chance *= (1.0 - (opp_bluff_success_rate - 0.5) * 0.15)
+
+    # Partner friendliness: medium/hard 10–20% less likely to call partners
+    if bidder and bidder in partners.get(player, []):
+        if diff == "hard":
+            call_chance *= 0.8
+        elif diff == "medium":
+            call_chance *= 0.85
+        else:
+            call_chance *= 0.95
+
+    if total_players_left <= 4:
+        call_chance *= 1.6
+
+    call_chance = max(0.02, min(call_chance, 0.95))
+
+    # Decision
+    if random.random() < call_chance:
+        return current_bid, current_bidder, True, player
+    else:
+        have = dice.count(face)
+        partner_have = sum(1 for v in partner_dice_list if v == face)
+        total_have = have + partner_have
+        conservative = qty >= max(9, threshold_quarter)
+        confidence_factor = 1.0 + (defend_success_self - 0.5) * (0.45 if diff == "hard" else 0.25) \
+                                + (bluff_success_self - 0.5) * (0.30 if diff == "hard" else 0.20)
+        if total_have >= 2 and not conservative:
+            inc_raw = random.choice([1, 1, 2])
+        else:
+            inc_raw = 1 if conservative or random.random() < 0.9 else 0
+        inc = max(1, int(round(inc_raw * confidence_factor)))
+        new_qty = min(qty + inc, total_dice)
+        face_bump_chance = 0.65 + (confidence_factor - 1.0) * 0.2
+        new_face = face if random.random() < min(0.95, max(0.05, face_bump_chance)) else min(6, face + random.choice([0, 1]))
+        maybe_print(f"\n{random.choice(table_talk['raise']).format(name=player, new_qty=new_qty, new_face=new_face)}\n")
+        return (new_qty, new_face), player, False, None
+
+# Main game loic
+def play_liars_dice(player_data, klare_data, enemy_count, difficulty, enemy_names, gold_bet=None, silent=False):
+    diff = str(difficulty).strip().lower()
+    if diff not in ("easy", "medium", "hard"):
+        diff = "medium"
+
+    # for 15+ players we will prefer fast printing in some places
+    def fast_print(*args, **kwargs):
+        if not silent:
+            print(*args, **kwargs)
+
+    def slow_or_fast_print(text):
+        if silent:
+            return
+        Print(text)
+
+    if gold_bet is None:
+        while True:
+            try:
+                gold_bet = int(input("Enter your gold bet per player: ").strip())
+                if gold_bet > 0:
+                    break
+                Print("Enter a positive integer.")
+            except ValueError:
+                Print("That is not a number, try again.")
+
+    enemy_count = max(1, int(enemy_count))
+    enemy_names = list(enemy_names or [])
+    enemy_names = enemy_names[:enemy_count]
+    while len(enemy_names) < enemy_count:
         enemy_names.append(f"Opponent {len(enemy_names)+1}")
+    players = ["Knight"] + enemy_names[:enemy_count]
+    total_players = len(players)
 
-    players = ["Knight"] + enemy_names[:7]
+    if player_data.get("gold", 0) < gold_bet:
+        Print("You do not have enough gold to make that bet.")
+        return player_data, klare_data
+    player_data["gold"] -= gold_bet
+    pot = gold_bet * len(players)
+
     active_players = {name: [] for name in players}
 
-    # Secret partner pairs, random per match
-    shuffled = players[:]
-    random.shuffle(shuffled)
-    partners = {}
-    for i in range(0, len(shuffled), 2):
-        a, b = shuffled[i], shuffled[i+1]
-        partners[a] = b
-        partners[b] = a
+    partners, k_partners, max_winners, split_rule = assign_partners(players)
 
-    # Per-match memory (fresh)
     match_memory = {name: {k: 0 for k in BASE_STATS} for name in players}
-    # Persistent memory across sessions
     global_memory = load_ai_memory(players)
 
-    # Ante
-    ante_each = gold_bet // len(players)
-    pot = ante_each * len(players)
-    leftover = gold_bet - pot
-    if leftover > 0:
-        player_data["gold"] += leftover
-
-    diff = difficulty.lower()
-    confidence_mods = {
-        "easy":   (0.28, 0.45),
-        "medium": (0.45, 0.65),
-        "hard":   (0.65, 0.85),
-    }
-    low, high = confidence_mods.get(diff, (0.45, 0.65))
-    share = pot // 2  # split between final two
-
-    # Opening text, wording change
-    Print(f"\nYou sit at a crowded tavern table with {len(players)} players.")
-    Print(f"Total pot is {pot} gold coins, each player adds {ante_each} to the pot. Top 2 split 50/50.\n")
-
-    watching = False
-    eliminated_order = []
-
-    # Table order
+    beaten_this_game = set()
+    elimination_order = []
     turn_order = deque(players)
     random.shuffle(turn_order)
-
-    allow_quit = False
+    next_round_starter_name = None
     round_start_index = 0
+    turn_counter = 0
 
-    # Track who made the current highest bid
-    current_bid = None           # (qty, face)
-    current_bidder = None        # name
+    slow_or_fast_print(f"\nYou sit at a crowded tavern table with {len(players)} players.")
+    slow_or_fast_print(f"Each player antes {gold_bet} gold, total pot is {pot}.")
+    if max_winners == 2:
+        slow_or_fast_print("Top 2 split the pot, if you and your partner are the final two, you receive 75 percent, your partner 25 percent.\n")
+    elif max_winners == 3:
+        slow_or_fast_print("Top 3 can win this match, pot splits 34/33/33.\n")
+    else:
+        slow_or_fast_print("Top 4 can win this match, pot splits 25/25/25/25.\n")
 
-    while len(active_players) > 2:
-        # Find a valid starter still active
-        for _ in range(len(turn_order)):
-            starter = turn_order[round_start_index % len(turn_order)]
-            if starter in active_players:
-                break
-            round_start_index += 1
+    # Watching / skipping controls after Knight elimination
+    skip_to_results = False
 
-        ordered = list(turn_order)
-        start_pos = ordered.index(starter)
-        round_order = deque(ordered[start_pos:] + ordered[:start_pos])
+    # main rounds
+    while len(active_players) > max_winners:
+        ordered_all = list(turn_order)
+        alive_set = set(active_players.keys())
 
-        # Prompt to roll, clear, then show turn order line
-        press_to_continue("Press Enter to roll dice and begin the round: ")
-        clear_cmd()
+        starter = None
+        if next_round_starter_name:
+            if next_round_starter_name in ordered_all:
+                idx_base = ordered_all.index(next_round_starter_name)
+            else:
+                idx_base = -1
+            for step in range(1, len(ordered_all)+1):
+                cand = ordered_all[(idx_base + step) % len(ordered_all)]
+                if cand in alive_set:
+                    starter = cand
+                    break
+            next_round_starter_name = None
+        if starter is None:
+            for _ in range(len(ordered_all)):
+                cand = ordered_all[round_start_index % len(ordered_all)]
+                round_start_index += 1
+                if cand in alive_set:
+                    starter = cand
+                    break
 
-        active_set = set(active_players.keys())
-        Print(render_turn_order(round_order, active_set, starter))
+        start_pos = ordered_all.index(starter)
+        round_order = deque(ordered_all[start_pos:] + ordered_all[:start_pos])
+
+        if not silent:
+            press_to_continue("Press Enter to roll dice and begin the round: ")
+            clear_cmd()
+
+        use_fast = len(active_players) >= 15
+        render_turn_order(round_order, alive_set, starter, fast=use_fast)
 
         # Roll dice
         for name in list(active_players.keys()):
             active_players[name] = [random.randint(1, 6) for _ in range(4)]
 
-        partner_name = partners.get("Knight")
-        partner_dice = active_players[partner_name] if partner_name in active_players else []
-
         if "Knight" in active_players:
-            Print(f"Your Dice: {active_players['Knight']} | Partner {partner_name if partner_name else '-'}: {partner_dice}")
+            pd = active_players["Knight"]
+            partner_names = partners.get("Knight", [])
+
+            # Build partner dice text dynamically
+            partner_texts = []
+            for pn in partner_names:
+                if pn in active_players:  # Partner still alive
+                    partner_dice = active_players[pn]
+                    partner_texts.append(f"{pn}'s Dice: {partner_dice}")
+
+            # Decide what to print based on how many partners are alive
+            if partner_texts:
+                msg = "Your Dice: {} | {}".format(pd, " | ".join(partner_texts))
+            else:
+                msg = f"Your Dice: {pd}"
+
+            # Print using correct style depending on player count
+            if len(active_players) >= 15:
+                print(msg)
+            else:
+                Print(msg)
+
 
         current_bid = None
         current_bidder = None
         round_over = False
-        Print(f"\n{starter} starts the round.")
+        if use_fast:
+            fast_print(f"\n{starter} starts the round.")
+        else:
+            slow_or_fast_print(f"\n{starter} starts the round.")
+        caller_this_round = None
 
-        # Round loop
+        # Track last-bid info only for success crediting; we no longer record "made" counters separately
+        last_bid_info = None
+        bids_in_round = 0
+
         while not round_over:
             for _ in range(len(round_order)):
                 if round_over:
                     break
-
-                if allow_quit and watching:
-                    choice = input("[Q] Quit now, or press Enter to keep watching: ").strip().lower()
-                    if choice == "q":
-                        Print("\nYou leave the table early, no final payouts are calculated.")
-                        merge_match_into_global(global_memory, match_memory)
-                        save_ai_memory(global_memory)
-                        return
-
                 player = round_order[0]
                 round_order.rotate(-1)
                 if player not in active_players:
                     continue
 
+                turn_counter += 1
+                if turn_counter % 40 == 0:
+                    save_ai_memory(global_memory)
+
                 total_players_left = len(active_players)
                 total_dice = sum(len(d) for d in active_players.values())
 
-                # --- Knight turn (fixed input loop) ---
                 if player == "Knight":
-                    while True:  # keep asking until a valid action is performed
+                    if "Knight" not in active_players:
+                        continue  # safety
+
+                    while True and not silent:
                         current_bid_text = f"{current_bid[0]} {current_bid[1]}'s" if current_bid else "No bids yet"
-                        partner_name = partners.get("Knight")
-                        partner_dice = active_players.get(partner_name, [])
+                        partner_names = partners.get("Knight", [])
+                        partner_dice_flat = []
+                        for pn in partner_names:
+                            if pn in active_players:
+                                partner_dice_flat.extend(active_players[pn])
 
                         Print("\n---------------------------")
-                        Print(f"Your Dice: {active_players['Knight']} | Partner {partner_name if partner_name else '-'}: {partner_dice}")
+
+                        # Show Knight's and partners' dice
+                        pd = active_players["Knight"]
+                        partner_names = partners.get("Knight", [])
+
+                        partner_texts = []
+                        for pn in partner_names:
+                            if pn in active_players:  # Only show surviving partners
+                                partner_dice = active_players[pn]
+                                partner_texts.append(f"{pn}'s Dice: {partner_dice}")
+
+                        if partner_texts:
+                            msg = "Your Dice: {} | {}".format(pd, " | ".join(partner_texts))
+                        else:
+                            msg = f"Your Dice: {pd}"
+
+                        if len(active_players) >= 15:
+                            print(msg)
+                        else:
+                            Print(msg)
+
                         Print(f"Players Left: {total_players_left} | Total Dice: {total_dice}")
                         Print(f"Current Bid: {current_bid_text}")
                         Print("[1] Up Bid")
@@ -293,58 +588,102 @@ def play_liars_dice(player_data, gold_bet, enemy_names, difficulty):
                         Print("---------------------------")
 
                         if action not in ("1", "2"):
-                            Print("\mInvalid choice, Enter 1 to Up Bid or 2 to Call Bluff.")
-                            continue  # do not end Knight’s turn
+                            Print("Invalid choice, Enter 1 to Up Bid or 2 to Call Bluff.")
+                            continue
 
-                        # CALL BLUFF
                         if action == "2":
                             if not current_bid or not current_bidder:
                                 Print("\nNo bid to call bluff on.")
-                                continue  # still Knight’s turn
+                                continue
 
                             qty, face = current_bid
+                            caller_this_round = "Knight"
+                            Print(f"\n[Knight] I am calling your {current_bid[0]} {current_bid[1]}'s.")
 
-                            Print("\n--- ALL DICE REVEALED ---")
-                            for name, dice in active_players.items():
-                                Print(f"{name}: {dice}")
-                            Print("--------------------------\n")
+                            # Reveal all dice (fast or slow)
+                            if len(active_players) >= 15:
+                                print("\n--- ALL DICE REVEALED ---")
+                                for name, dice in active_players.items():
+                                    print(f"{name}: {dice}")
+                                print("--------------------------\n")
+                            else:
+                                Print("\n--- ALL DICE REVEALED ---")
+                                for name, dice in active_players.items():
+                                    Print(f"{name}: {dice}")
+                                Print("--------------------------\n")
 
                             actual_count = sum(d.count(face) for d in active_players.values())
-                            Print(f"The bid was {qty} {face}'s, there are {actual_count} {face}'s.")
+                            msg = f"The bid was {qty} {face}'s, there are {actual_count} {face}'s."
+                            if len(active_players) >= 15:
+                                fast_print(msg)
+                            else:
+                                Print(msg)
 
                             bidder = current_bidder
                             was_truth = actual_count >= qty
 
-                            if was_truth:
-                                # Knight wrong, bidder defended
-                                Print("Knight loses the bluff and is OUT!")
-                                if "Knight" in active_players:
-                                    del active_players["Knight"]
-                                watching = True
-                                allow_quit = True
-                                eliminated_order.append("Knight")
+                            if last_bid_info and last_bid_info["bidder"] == bidder:
+                                last_bid_info["resolved"] = True
 
-                                # Stats
+                            _ensure_ai(global_memory, bidder)
+                            _ensure_ai(match_memory, bidder)
+
+                            if was_truth:
+                                # caller out
+                                out_name = caller_this_round
+                                if len(active_players) >= 15:
+                                    fast_print(f"{out_name} loses the bluff and is OUT!")
+                                else:
+                                    Print(f"{out_name} loses the bluff and is OUT!")
+                                if out_name in active_players:
+                                    del active_players[out_name]
+                                    elimination_order.append(out_name)
+                                    if "Knight" in active_players and out_name != "Knight":
+                                        beaten_this_game.add(out_name)
+
+                                # Update bidder stats
+                                global_memory[bidder]["truths_made"] += 1
+                                global_memory[bidder]["truth_success"] += 1
+                                global_memory[bidder]["defended_success"] += 1
+                                match_memory[bidder]["truths_made"] += 1
+                                match_memory[bidder]["truth_success"] += 1
                                 match_memory[bidder]["defended_success"] += 1
-                                record_bid_outcome(bidder, was_truth=True, was_success=True, match_memory=match_memory)
+
                             else:
-                                # Bidder bluffing, bidder out
-                                Print(f"{bidder} was bluffing and is OUT!")
+                                # bidder out
+                                if len(active_players) >= 15:
+                                    fast_print(f"{bidder} was bluffing and is OUT!")
+                                else:
+                                    Print(f"{bidder} was bluffing and is OUT!")
                                 if bidder in active_players:
                                     del active_players[bidder]
-                                eliminated_order.append(bidder)
+                                    elimination_order.append(bidder)
+                                    if "Knight" in active_players and bidder != "Knight":
+                                        beaten_this_game.add(bidder)
 
-                                # Stats
+                                global_memory[bidder]["bluffs_made"] += 1
+                                global_memory[bidder]["bluffs_caught"] += 1
+                                match_memory[bidder]["bluffs_made"] += 1
                                 match_memory[bidder]["bluffs_caught"] += 1
-                                record_bid_outcome(bidder, was_truth=False, was_success=False, match_memory=match_memory)
 
+                            save_ai_memory(global_memory)
+                            next_round_starter_name = caller_this_round
                             round_over = True
-                            break  # Knight’s action completed
+                            break
 
-                        # UP BID
                         else:
+                            # Knight raises
+                            # Crediting success to previous bid if not already resolved
+                            if last_bid_info and not last_bid_info.get("resolved"):
+                                prev_bidder = last_bid_info["bidder"]
+                                if last_bid_info["was_bluff_calc"]:
+                                    global_memory[prev_bidder]["bluff_success"] += 1
+                                elif last_bid_info["was_truth_actual"]:
+                                    global_memory[prev_bidder]["truth_success"] += 1
+                                save_ai_memory(global_memory)
+
                             while True:
-                                bet = input("Enter Bid: ").strip().split()
+                                bet = input("Enter Bid as 'quantity' of 'face' (eg. 3 4): ").strip().split()
                                 if len(bet) != 2 or not all(x.isdigit() for x in bet):
                                     Print("Invalid format, example: 3 4")
                                     continue
@@ -361,244 +700,414 @@ def play_liars_dice(player_data, gold_bet, enemy_names, difficulty):
                                 if qty > total_dice:
                                     Print(f"Quantity too high, max is {total_dice}.")
                                     continue
+
                                 current_bid = (qty, face)
                                 current_bidder = "Knight"
-                                Print(f"Knight bids {qty} dice of {face}'s.")
-                                break  # bid accepted
-                            break  # Knight’s action completed
+                                bids_in_round += 1
+                                # build last bid info
+                                actual = sum(d.count(face) for d in active_players.values())
+                                last_bid_info = {
+                                    "bidder": "Knight",
+                                    "bid": (qty, face),
+                                    "was_bluff_calc": qty > actual,
+                                    "was_truth_actual": qty <= actual,
+                                    "resolved": False,
+                                }
 
-                # --- NPC turn ---
+                                Print(f"\nKnight bids {qty} dice of {face}'s.")
+                                break
+                            break
+
                 else:
-                    if player == "Knight" and watching:
-                        Print("You watch the table")
-                        continue
+                    result_bid, result_bidder, wants_reveal, caller = ai_take_turn(
+                        player=player,
+                        active_players=active_players,
+                        partners=partners,
+                        current_bid=current_bid,
+                        current_bidder=current_bidder,
+                        global_memory=global_memory,
+                        difficulty=diff,
+                        noise_gate=True
+                    )
 
-                    # NPC pacing
-                    if watching or "Knight" in active_players:
-                        time.sleep(random.uniform(0.35, 0.75))
+                    if wants_reveal:
+                        caller_this_round = caller or player
+                        # Bluff call line remains slow Print for drama
+                        Print(f"\n{random.choice(table_talk['call_bluff']).format(name=caller_this_round)}\n")
 
-                    dice = active_players[player]
-                    partner = partners.get(player)
-                    partner_dice = active_players.get(partner, [])
-
-                    threshold_third = (total_dice + 2) // 3  # ceil(total_dice/3)
-
-                    # Prepare emergent stats (self + opponent)
-                    self_stats = combined_stats(player, match_memory, global_memory, global_weight=0.5)
-                    bluff_rate_self = _safe_rate(self_stats["bluffs_made"], self_stats["truths_made"] + self_stats["bluffs_made"])
-                    bluff_success_self = _safe_rate(self_stats["bluff_success"], self_stats["bluffs_made"])
-                    defend_success_self = _safe_rate(self_stats["defended_success"], self_stats["defended_success"] + self_stats["bluffs_caught"])
-
-                    # Opening bid
-                    if not current_bid:
-                        face_counts = {f: dice.count(f) for f in range(1, 7)}
-                        common_face = max(face_counts, key=face_counts.get)
-                        face_guess = common_face if random.random() < 0.7 else random.randint(2, 5)
-                        base_qty = dice.count(face_guess)
-                        if partner_dice and random.random() < 0.55:
-                            base_qty += partner_dice.count(face_guess)
-
-                        # Confidence bump from past success
-                        confidence_factor = 1.0 + (bluff_success_self - 0.5) * (0.6 if diff == "hard" else 0.35)
-                        qty_guess = int(max(2, min(base_qty + random.choice([0, 1]) * confidence_factor, total_dice)))
-                        current_bid = (qty_guess, face_guess)
-                        current_bidder = player
-                        if watching or "Knight" in active_players:
-                            Print(f"\n{random.choice(table_talk['pre_bid']).format(name=player, next_qty=qty_guess, face=face_guess, target='Knight')}")
-                            Print(f"{player} opens with {qty_guess} {face_guess}'s.\n")
-                        continue
-
-                    # Evaluate call vs raise against current bidder
-                    qty, face = current_bid
-                    known_count = dice.count(face)
-                    if partner_dice and random.random() < (0.5 if diff == "hard" else 0.35):
-                        known_count += partner_dice.count(face)
-
-                    unknown_dice = total_dice - len(dice) - len(partner_dice)
-                    need = max(0, qty - known_count)
-                    p_true = prob_at_least(need, unknown_dice, p=1/6)
-
-                    estimate_factor = random.uniform(low, high)
-                    estimated_total = known_count + int(unknown_dice * estimate_factor)
-                    estimated_total += random.randint(-1, 1)
-                    bluff_margin = qty - estimated_total
-
-                    call_chance = 0.08 + max(0, bluff_margin) * 0.10
-                    call_chance += (1.0 - p_true) * (0.75 if diff == "hard" else 0.45)
-
-                    if qty > threshold_third:
-                        call_chance += 0.15 * (qty - threshold_third)
-
-                    if qty > 8:
-                        call_chance += 0.12 + (qty - 8) * 0.03
-
-                    if diff == "easy":
-                        call_chance *= 0.65
-                    elif diff == "hard":
-                        call_chance *= 1.10
-
-                    # Opponent modeling: the CURRENT bidder we are judging
-                    bidder = current_bidder
-                    if bidder:
-                        opp_stats = combined_stats(bidder, match_memory, global_memory, global_weight=0.5)
-                        opp_bluff_rate = _safe_rate(opp_stats["bluffs_made"], opp_stats["truths_made"] + opp_stats["bluffs_made"])
-                        opp_bluff_success_rate = _safe_rate(opp_stats["bluff_success"], opp_stats["bluffs_made"])
-                        opp_defend_success_rate = _safe_rate(opp_stats["defended_success"], opp_stats["defended_success"] + opp_stats["bluffs_caught"])
-
-                        # If bidder often bluffs, we are more willing to call.
-                        call_chance *= (1.0 + (opp_bluff_rate - 0.5) * (0.9 if diff == "hard" else 0.55))
-                        # If bidder often survives calls with true bids, we hesitate to call.
-                        call_chance *= (1.0 - (opp_defend_success_rate - 0.5) * (0.6 if diff == "hard" else 0.35))
-                        # If bidder’s bluffs tend to survive (rare), hesitancy increases slightly.
-                        call_chance *= (1.0 - (opp_bluff_success_rate - 0.5) * (0.25 if diff == "hard" else 0.15))
-
-                    # Partner protection: if last bidder is partner, less likely to call
-                    if bidder and partners.get(player) == bidder:
-                        call_chance *= 0.6
-
-                    # Reckless raise guard: if we and partner have 0 of the face and bid is large
-                    have = dice.count(face)
-                    partner_have = partner_dice.count(face) if partner_dice else 0
-                    if (have + partner_have == 0) and qty > threshold_third:
-                        call_chance += 0.25
-
-                    # Clamp then late-game restraint
-                    call_chance = max(0.02, min(call_chance, 0.95))
-
-                    if diff in ("medium", "hard") and total_players_left <= 3:
-                        if current_bid and current_bid[0] <= 3:
-                            call_chance *= (0.45 if diff == "medium" else 0.35)
+                        qty, face = current_bid
+                        # Reveal all dice (fast or slow)
+                        if len(active_players) >= 15:
+                            print("\n--- ALL DICE REVEALED ---")
+                            for name, dice in active_players.items():
+                                print(f"{name}: {dice}")
+                            print("--------------------------\n")
                         else:
-                            call_chance *= (0.7 if diff == "medium" else 0.6)
-
-                    # --- Plausibility filter: never call very believable low bids early ---
-                    if diff in ("medium", "hard"):
-                        total_dice = sum(len(d) for d in active_players.values())
-                        plausible_floor = 0.09  # how "plausible" must a bid be before calling
-                        # Probability that at least qty of face exist, given total dice
-                        p_plausible = prob_at_least(qty, total_dice, p=1/6)
-
-                        # If it's still statistically very likely, dampen calling chance heavily
-                        if p_plausible > 0.4:  # pretty believable claim
-                            scale = 0.25 if diff == "hard" else 0.4
-                            call_chance *= scale
-
-                    # Decide CALL vs RAISE
-                    if random.random() < call_chance:
-                        if watching or "Knight" in active_players:
-                            Print(f"\n{random.choice(table_talk['call_bluff']).format(name=player)}\n")
-                            Print("--- ALL DICE REVEALED ---")
-                            for n, d in active_players.items():
-                                Print(f"{n}: {d}")
+                            Print("\n--- ALL DICE REVEALED ---")
+                            for name, dice in active_players.items():
+                                Print(f"{name}: {dice}")
                             Print("--------------------------\n")
 
                         actual_count = sum(d.count(face) for d in active_players.values())
-                        if watching or "Knight" in active_players:
-                            Print(f"The bid was {qty} {face}'s, there are {actual_count} {face}'s.")
-
-                        was_truth = actual_count >= qty
-                        if was_truth:
-                            # Caller wrong, bidder defended
-                            if watching or "Knight" in active_players:
-                                Print(f"{player} loses the bluff and is OUT!")
-                            if player in active_players:
-                                del active_players[player]
-                            eliminated_order.append(player)
-
-                            match_memory[bidder]["defended_success"] += 1
-                            record_bid_outcome(bidder, was_truth=True, was_success=True, match_memory=match_memory)
+                        msg = f"The bid was {qty} {face}'s, there are {actual_count} {face}'s."
+                        if len(active_players) >= 15:
+                            fast_print(msg)
                         else:
-                            # Bidder bluffing, bidder out
-                            if watching or "Knight" in active_players:
+                            Print(msg)
+
+                        bidder = current_bidder
+                        was_truth = actual_count >= qty
+
+                        if last_bid_info and last_bid_info["bidder"] == bidder:
+                            last_bid_info["resolved"] = True
+
+                        _ensure_ai(global_memory, bidder)
+                        _ensure_ai(match_memory, bidder)
+
+                        if was_truth:
+                            # caller out
+                            out_name = caller_this_round
+                            if len(active_players) >= 15:
+                                fast_print(f"{out_name} loses the bluff and is OUT!")
+                            else:
+                                Print(f"{out_name} loses the bluff and is OUT!")
+                            if out_name in active_players:
+                                del active_players[out_name]
+                                elimination_order.append(out_name)
+                                if "Knight" in active_players and out_name != "Knight":
+                                    beaten_this_game.add(out_name)
+
+                            global_memory[bidder]["truths_made"] += 1
+                            global_memory[bidder]["truth_success"] += 1
+                            global_memory[bidder]["defended_success"] += 1
+                            match_memory[bidder]["truths_made"] += 1
+                            match_memory[bidder]["truth_success"] += 1
+                            match_memory[bidder]["defended_success"] += 1
+
+                        else:
+                            # bidder out
+                            if len(active_players) >= 15:
+                                fast_print(f"{bidder} was bluffing and is OUT!")
+                            else:
                                 Print(f"{bidder} was bluffing and is OUT!")
                             if bidder in active_players:
                                 del active_players[bidder]
-                            eliminated_order.append(bidder)
+                                elimination_order.append(bidder)
+                                if "Knight" in active_players and bidder != "Knight":
+                                    beaten_this_game.add(bidder)
 
+                            global_memory[bidder]["bluffs_made"] += 1
+                            global_memory[bidder]["bluffs_caught"] += 1
+                            match_memory[bidder]["bluffs_made"] += 1
                             match_memory[bidder]["bluffs_caught"] += 1
-                            record_bid_outcome(bidder, was_truth=False, was_success=False, match_memory=match_memory)
 
+                        save_ai_memory(global_memory)
+                        next_round_starter_name = caller_this_round
                         round_over = True
+                        break
 
                     else:
-                        # Raising behavior influenced by self confidence vs fear of next caller
-                        # Self-confidence: if our truth/defend/bluff success are high, raise more
-                        confidence_factor = 1.0 + (defend_success_self - 0.5) * (0.5 if diff == "hard" else 0.3) \
-                                                + (bluff_success_self - 0.5) * (0.35 if diff == "hard" else 0.2)
-                        conservative = qty >= max(9, threshold_third)
-                        total_have = have + (partner_dice.count(face) if partner_dice else 0)
+                        # AI raises; credit previous unresolved bid with success
+                        if last_bid_info and not last_bid_info.get("resolved"):
+                            prev_bidder = last_bid_info["bidder"]
+                            if last_bid_info["was_bluff_calc"]:
+                                global_memory[prev_bidder]["bluff_success"] += 1
+                            elif last_bid_info["was_truth_actual"]:
+                                global_memory[prev_bidder]["truth_success"] += 1
+                            save_ai_memory(global_memory)
 
-                        if total_have >= 2 and not conservative:
-                            inc_raw = random.choice([1, 1, 2])
-                        else:
-                            inc_raw = 1 if conservative or random.random() < 0.9 else 0
-                        inc = max(1, int(round(inc_raw * confidence_factor)))
+                        current_bid = result_bid
+                        current_bidder = result_bidder
+                        bids_in_round += 1
 
-                        new_qty = min(qty + inc, total_dice)
-                        # Be a little more willing to bump face when confident
-                        face_bump_chance = 0.65 + (confidence_factor - 1.0) * 0.2
-                        new_face = face if random.random() < min(0.95, max(0.05, face_bump_chance)) else min(6, face + random.choice([0, 1]))
-                        current_bid = (new_qty, new_face)
-                        current_bidder = player
+                        # update last bid info
+                        qty2, face2 = current_bid
+                        actual2 = sum(d.count(face2) for d in active_players.values())
+                        last_bid_info = {
+                            "bidder": result_bidder,
+                            "bid": (qty2, face2),
+                            "was_bluff_calc": qty2 > actual2,
+                            "was_truth_actual": qty2 <= actual2,
+                            "resolved": False,
+                        }
 
-                        if watching or "Knight" in active_players:
-                            Print(f"\n{random.choice(table_talk['raise']).format(name=player, new_qty=new_qty, new_face=new_face)}\n")
+        if not silent:
+            press_to_continue()
+            clear_cmd()
 
-        round_start_index = (round_start_index + 1) % len(turn_order)
-        press_to_continue()
-        clear_cmd()
+        # If Knight just got eliminated, offer skip option once
+        if "Knight" not in active_players and not skip_to_results and not silent:
+            Print("\nYou have been eliminated.")
+            Print("[1] Watch the rest")
+            Print("[2] Skip to final results")
+            choice = input("Enter: ").strip()
+            if choice == "2":
+                skip_to_results = True
+                silent = True  # suppress all drama/pauses going forward
 
-    # Final split
     survivors = list(active_players.keys())
-    Print("\nFinal 2 survivors split the pot 50/50!\n")
-    knight_partner = partners.get("Knight")
-    if "Knight" in survivors and knight_partner in survivors:
-        bonus = share // 2
-        player_data["gold"] += share + bonus
-        Print(f"Knight and partner {knight_partner} survive together, team bonus! Knight gets {share}+{bonus} gold, total {player_data['gold']}")
-        Print(f"{knight_partner} takes {share} gold.")
-    else:
-        for name in survivors:
-            if name == "Knight":
-                player_data["gold"] += share
-                Print(f"Knight gets {share} gold, total {player_data['gold']}")
+    slow_or_fast_print("\nFinal survivors reached.\n")
+
+    # Show partner pairs (compact)
+    if not silent:
+        Print("Partner pairs this match:")
+        seen = set()
+        for a in players:
+            if a in seen:
+                continue
+            ps = partners.get(a, [])
+            group = [a] + ps
+            for g in group:
+                seen.add(g)
+            Print(f"{a} ↔ {', '.join(ps) if ps else '-'}")
+
+        Print("\nElimination order (first out -> last out):")
+        Print(", ".join(elimination_order + survivors))
+
+    # Payouts
+    if "Knight" in survivors:
+        if len(survivors) == 2:
+            # special 75/25 if Knight and a partner are the last two
+            other = [s for s in survivors if s != "Knight"][0]
+            if other in partners.get("Knight", []):
+                knight_reward = int(pot * 0.75)
+                partner_reward = pot - knight_reward
+                player_data["gold"] += knight_reward
+                slow_or_fast_print(f"\nKnight and partner {other} survive together.")
+                slow_or_fast_print(f"Knight receives {knight_reward} gold, {other} receives {partner_reward} gold.")
             else:
-                Print(f"{name} takes {share} gold.")
+                # normal 50/50
+                reward = (pot * split_rule[0]) // 100 if split_rule == [50, 50] else pot // 2
+                player_data["gold"] += reward
+                slow_or_fast_print(f"\nKnight survives to the final two and receives {reward} gold.")
+        else:
+            # 3 or 4 winners or unusual multiple survivors case
+            if len(survivors) == 3 and split_rule == [34, 33, 33]:
+                # allocate integer split by first 34 to someone; if Knight is among, give Knight 34%
+                if "Knight" in survivors:
+                    knight_reward = (pot * 34) // 100
+                else:
+                    knight_reward = (pot * 33) // 100
+                player_data["gold"] += knight_reward
+                slow_or_fast_print(f"\nThree winners. Knight receives {knight_reward} gold by rule (34/33/33).")
+            elif len(survivors) == 4 and split_rule == [25, 25, 25, 25]:
+                reward = (pot * 25) // 100
+                player_data["gold"] += reward
+                slow_or_fast_print(f"\nFour winners. Knight receives {reward} gold by rule (25% each).")
+            else:
+                # fallback: split equally among survivors
+                reward = pot // max(2, len(survivors))
+                player_data["gold"] += reward
+                slow_or_fast_print(f"\nMultiple survivors. Knight receives {reward} gold by rule.")
+    else:
+        slow_or_fast_print("\nKnight did not make the final group. No gold awarded.")
 
-    # Reveal partner pairs
-    Print("\nPartner pairs this match:")
-    seen = set()
-    for a in players:
-        b = partners[a]
-        if a not in seen and b not in seen:
-            Print(f"{a} ↔ {b}")
-            seen.add(a); seen.add(b)
+    diff_key = f"{diff}_beaten"
+    if isinstance(klare_data, dict):
+        klare_data.setdefault(diff_key, [])
+        for name in sorted(beaten_this_game):
+            if name != "Knight" and name not in klare_data[diff_key]:
+                klare_data[diff_key].append(name)
 
-    Print("\nGame Over.\n")
-    Print("Elimination order, first out → last out:")
-    Print(", ".join(eliminated_order) if eliminated_order else "No eliminations recorded.")
-
-    # Persist memory (emergent personalities accumulate naturally)
     merge_match_into_global(global_memory, match_memory)
     save_ai_memory(global_memory)
 
-# --- Main Entry ---
-if __name__ == "__main__":
-    player_data = {"gold": 200}
+    if not silent:
+        Print("\nSummary:")
+        Print(f"  • Players total: {len(players)}")
+        Print(f"  • Pot: {pot} gold")
+        Print(f"  • Knight final gold: {player_data.get('gold', 0)}")
+        beaten_list = ", ".join(sorted(beaten_this_game)) if beaten_this_game else "None"
+        Print(f"  • Beaten AIs this match: {beaten_list}")
+
+    return player_data, klare_data
+
+# Klare data placeholder when this file is main
+def _placeholder_klare_data():
+    return {
+        "day_pass": False,
+        "basic_pass": False,
+        "premium_pass": False,
+        "easy_beaten": [],
+        "medium_beaten": [],
+        "hard_beaten": [],
+        "easy_pro_beaten": False,
+        "medium_pro_beaten": False,
+        "hard_pro_beaten": False,
+    }
+
+# Help menu
+def help_menu():
     while True:
+        press_to_continue()
+        clear_cmd()
+        print("===== LIAR'S DICE - HELP MENU =====\n")
+
+        print("=== OBJECTIVE ===")
+        print("The goal of Liar’s Dice is to outlast every other player by making accurate bids or calling out false ones. "
+              "Each player secretly rolls dice, and on their turn they must either RAISE the current bid or CALL BLUFF. "
+              "When a bluff is called, all dice are revealed and one player is eliminated.\n")
+
+        print("=== BASIC TERMS ===")
+        print("• Bid: A claim about how many dice of a specific face value exist across ALL players (e.g. '3 4's' means at least 3 dice show a 4).")
+        print("• Raise: Increasing the current bid. You must either increase the quantity or raise the face while keeping the quantity the same.")
+        print("• Caller: The player who chooses to call bluff on the current bidder’s claim.")
+        print("• Current Bidder: The player who made the most recent bid.")
+        print("• Round: A cycle of bidding and bluff-calling that ends when one player is eliminated.\n")
+
+        print("=== TURN ORDER DISPLAY ===")
+        print("At the start of each round, you’ll see a list of players in order of turns. "
+              "The active player’s name is highlighted in green. As players are eliminated, they disappear from the list. "
+              "Turn order rotates automatically each round, beginning with the player after whoever last called a bluff.\n")
+
+        print("=== HOW TO MAKE A LEGAL BID ===")
+        print("On your turn, you can choose to [1] Up Bid or [2] Call Bluff.\n")
+        print("When choosing to Up Bid, you must type two numbers separated by a space, for example:")
+        print("    4 5")
+        print("This means you are claiming there are at least 4 dice showing a face of 5 across the entire table.\n")
+        print("A bid is only LEGAL if it increases the total quantity or, if the quantity stays the same, raises the face value.\n")
+        print("Examples of LEGAL raises:")
+        print("• From '3 4' to '4 4'  (quantity increased)")
+        print("• From '4 4' to '4 5'  (face increased)")
+        print("Examples of ILLEGAL raises:")
+        print("• From '3 4' to '3 1'  (face decreased)")
+        print("• From '4 4' to '3 6'  (quantity decreased)\n")
+
+        print("=== CALLING A BLUFF ===")
+        print("If you think the current bid is false, choose to Call Bluff. "
+              "All dice are revealed and compared to the claim.\n")
+        print("• If the bid was TRUE (enough dice matched), the CALLER is eliminated.")
+        print("• If the bid was FALSE (not enough dice), the BIDDER is eliminated.\n")
+        print("There are no retries or second chances... once eliminated, you are out of the match.\n")
+
+        print("=== PARTNERS ===")
+        print("Depending on the number of players, you may have one or more partners. "
+              "Your partner’s dice will be visible to you each round while they are still in the game.\n")
+        print("• 2–17 players: 1 partner (2 winners total)\n"
+              "• 18–31 players: 2 partners (3 winners total, 34/33/33 gold split)\n"
+              "• 32+ players: 3 partners (4 winners total, 25% each)\n")
+        print("If you and your partner(s) are among the last survivors, you share the gold rewards. "
+              "If you and a single partner are the final two, the split is 75% for you, 25% for your partner.\n")
+
+        print("=== GOLD, BETS, AND REWARDS ===")
+        print("Each player adds gold into a shared pot at the start of a match. "
+              "When the game ends, survivors split the pot according to player count:\n"
+              "• 2 survivors: 50/50, or 75/25 if Knight + partner.\n"
+              "• 3 survivors: 34/33/33.\n"
+              "• 4 survivors: 25% each.\n")
+        print("If you are eliminated before the end, your gold is lost.\n")
+
+        print("=== AI DIFFICULTY ===")
+        print("The AI behaves differently at each difficulty level:\n"
+              "• Easy: Plays cautiously, rarely uses partner dice in bidding, and avoids calls.\n"
+              "• Medium: Considers partner dice sometimes, mixes confidence and caution.\n"
+              "• Hard: Always calculates with partner dice, adapts using stored memory from previous games, "
+              "and uses accurate probability for its decisions.\n")
+
+        print("=== MATCH FLOW ===")
+        print("1. All players roll dice.\n"
+              "2. Starting player makes the first bid.\n"
+              "3. Each player either raises the bid or calls bluff.\n"
+              "4. When a bluff is called, dice are revealed and one player is eliminated.\n"
+              "5. The person after the caller starts the next round.\n"
+              "6. The game continues until the required number of survivors remain.\n")
+
+        print("=== ELIMINATION AND ENDGAME ===")
+        print("When you are called out correctly (your bid was false), you are eliminated immediately with no chance to continue. "
+              "If your call was correct, the bidder is eliminated instead.\n")
+        print("The match ends once the survivor count matches the number of winners for that player range (2, 3, or 4). "
+              "Gold rewards are then distributed automatically according to the final survivor group.\n")
+
+        print("=== QUICK REMINDERS ===")
+        print("• Enter bids as two numbers: quantity then face (e.g., 3 5).\n"
+              "• You cannot lower a bid’s quantity or face value.\n"
+              "• You can always call bluff instead of raising.\n"
+              "• The active player is highlighted in green at the top of the screen.\n"
+              "• Eliminated players are permanently out — no respawns, no retries.\n")
+
+        print("=====================================")
+        print("Press Enter to return.")
+        input("Enter: ").strip().lower()
+        break  
+
+# Update log
+def updatelog():
+    clear_cmd()
+    Print("-----Current Version: V2-----")
+    print("- Added standalone menu with Rules, Update Log, and Play options.")
+    print("- Expanded player scaling beyond 8 participants; supports 2–32+ players.")
+    print("- Added dynamic partner system:")
+    print("   • 2–17 players → 1 partner, 2 total winners (50/50 or 75/25 split).")
+    print("   • 18–31 players → 2 partners, 3 total winners (34/33/33 split).")
+    print("   • 32+ players → 3 partners, 4 total winners (25% each).")
+    print("- Introduced new probability balancing for large-table realism; AIs avoid early impossible calls.")
+    print("- Added persistent AI memory saving to external JSON file (auto-saves during play).")
+    print("- New difficulty tuning:")
+    print("   • Easy: simplified reasoning, slower adaptation.")
+    print("   • Medium: balanced confidence and partner use.")
+    print("   • Hard: full probabilistic reasoning using partner dice and memory.")
+    print("- Reworked turn pacing and AI noise gate for faster performance at 15+ players.")
+    print("- Improved reveal and dice printing for large matches (fast print mode).")
+    print("- Added post-elimination option to skip or watch remaining rounds.")
+    print("- Integrated `klare_data` tracking for which AI names you've beaten by difficulty.")
+    print("- Added structured gold payout system with dynamic split rules and proper rounding.")
+    print("- Improved probability helper for more accurate bluff analysis.")
+    print("- Rewrote partner assignment to ensure even distribution across large tables.")
+    print("- Added emergent AI behaviors that evolve via saved statistics between sessions.")
+    print("\n---Bugs/Changes---")
+    print("- Fixed edge cases where bids could exceed total dice count.")
+    print("- Fixed partner dice not counting properly on some AI difficulties.")
+    print("- Fixed saved memory overwriting on corrupted files.")
+    print("- Fixed crash when AI_MEMORY_FILE missing or malformed.")
+    print("- Improved stability when the Knight is eliminated early.")
+    print("- Adjusted AI call thresholds to prevent overly-aggressive play at large tables.")
+    print("- Adjusted output pacing and formatting for better readability.")
+    print("- Refined elimination order tracking and end-of-game summaries.")
+
+if __name__ == "__main__":
+    # Standalone menu
+    while True:
+        print("\nLIAR'S DICE – Standalone")
+        print("[1] Play")
+        print("[2] Rules")
+        print("[3] Update Log")
+        print("[4] Quit")
+        choice = input("Enter: ").strip()
+        if choice == "2":
+            help_menu()
+            clear_cmd()
+            continue
+        if choice == "3":
+            updatelog()
+            press_to_continue()
+            clear_cmd()
+            continue
+        if choice == "4":
+            raise SystemExit
+        if choice != "1":
+            print("Invalid choice.")
+            continue
+
+        player_data = {"gold": 500}
+        klare_data = _placeholder_klare_data()
+
         try:
-            gold_bet = int(input("Enter your gold bet, total pot: ").strip())
-            if gold_bet <= 0:
-                Print("Enter a positive integer.")
-                continue
-            break
+            enemy_count = int(input("How many opponents? ").strip())
         except ValueError:
-            Print("That's not a number, try again.")
-    enemy_names = ["Jerry", "Bob", "Mark", "Lucy", "Tom", "Alice", "Sam"]
-    print("Select difficulty:\n[1] Easy\n[2] Medium\n[3] Hard")
-    diff_choice = input("Enter: ").strip()
-    difficulty = {"1": "Easy", "2": "Medium", "3": "Hard"}.get(diff_choice, "Medium")
-    Print(f"\nDifficulty set to {difficulty}")
-    Print("\n--REMINDER--")
-    print("Enter your bid as 'quantity face', e.g., 3 4 (Meaning you bet atleast 3 of the dice have a face of 4)\n")
-    play_liars_dice(player_data, gold_bet, enemy_names, difficulty)
+            enemy_count = 7
+
+        difficulty = input("Difficulty [easy/medium/hard]: ").strip().lower() or "medium"
+        try:
+            gold_bet = int(input("Gold bet per player: ").strip())
+        except ValueError:
+            gold_bet = 50
+
+        default_names = ["Joe", "Bob", "Frank", "Sue", "Tom", "Lily", "Max", "Emma", "Nia", "Zed", "Kara", "Vince",
+                         "Mira", "Ike", "Tess", "Odin", "Quinn", "Rhea", "Pax", "Uma", "Xan", "Yuri"]
+        enemy_names = default_names[:enemy_count]
+
+        Print(f"\nYou will play Liar's Dice against {enemy_count} opponents for {gold_bet} gold each.\n")
+        player_data, klare_data = play_liars_dice(player_data, klare_data, enemy_count, difficulty, enemy_names, gold_bet)
+
+        Print(f"\nFinal gold: {player_data.get('gold', 0)}")
+        Print(f"Beaten lists: easy={klare_data['easy_beaten']}, medium={klare_data['medium_beaten']}, hard={klare_data['hard_beaten']}")
